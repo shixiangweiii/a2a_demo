@@ -31,14 +31,65 @@ from a2a.types import (
     AgentInterface,
     AgentSkill,
 )
+from a2a.types.a2a_pb2 import (
+    HTTPAuthSecurityScheme,
+    SecurityRequirement,
+    SecurityScheme,
+    StringList,
+)
 from server.agent_executor import TranslatorAgentExecutor
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.requests import Request
-from starlette.responses import Response
+from starlette.responses import JSONResponse, Response
 
 logger = logging.getLogger(__name__)
+
+# ============================================================
+# 批次 C2：Bearer 鉴权 — 教学用简易白名单
+# ============================================================
+VALID_BEARER_TOKENS: set[str] = {"demo-secret-token", "another-token"}
+# 路径前缀谁免鉴权（Agent 发现依赖 Agent Card 端点公开访问）
+PUBLIC_PATH_PREFIXES: tuple[str, ...] = ("/.well-known/",)
+
+
+class BearerAuthMiddleware(BaseHTTPMiddleware):
+    """简易 Bearer 鉴权中间件（教学用）。
+
+    - Agent Card 等公开端点（/.well-known/前缀）免鉴权，方便客户端发现。
+    - 其他请求必须携带 Authorization: Bearer <token>，且 token 在白名单中。
+    """
+
+    async def dispatch(
+        self, request: Request, call_next: RequestResponseEndpoint
+    ) -> Response:
+        path = request.url.path
+        if any(path.startswith(p) for p in PUBLIC_PATH_PREFIXES):
+            return await call_next(request)
+
+        auth = request.headers.get("authorization", "")
+        if not auth.lower().startswith("bearer "):
+            logger.warning(
+                "🔐 [鉴权] 缺失 Authorization：path=%s", path
+            )
+            return JSONResponse(
+                {"error": "missing_bearer", "message": "请在 Authorization 头部携带 Bearer token"},
+                status_code=401,
+                headers={"WWW-Authenticate": 'Bearer realm="a2a"'},
+            )
+        token = auth[len("bearer "):].strip()
+        if token not in VALID_BEARER_TOKENS:
+            logger.warning(
+                "🔐 [鉴权] 无效 token：path=%s token_prefix=%s", path, token[:6]
+            )
+            return JSONResponse(
+                {"error": "invalid_token", "message": "token 无效"},
+                status_code=401,
+                headers={"WWW-Authenticate": 'Bearer realm="a2a", error="invalid_token"'},
+            )
+        logger.info("🔐 [鉴权] ✅ token 校验通过，path=%s", path)
+        return await call_next(request)
 
 
 class RequestLoggingMiddleware(BaseHTTPMiddleware):
@@ -94,6 +145,28 @@ def main():
         description="将中文文本翻译为英文。支持常用短语和句子的翻译。",
         tags=["翻译", "中文", "英文", "translation"],
         examples=["你好", "今天天气怎么样", "人工智能"],
+        input_modes=["text/plain"],
+        output_modes=["text/plain"],
+    )
+    # C1：批量翻译——演示 DataPart
+    skill_batch = AgentSkill(
+        id="translate_batch_zh_to_en",
+        name="批量翻译（中→英）",
+        description="批量翻译多条中文文本，输入/输出均为结构化 JSON（DataPart）。",
+        tags=["批量", "batch", "DataPart"],
+        examples=['{"items":["你好","早上好","谢谢"]}'],
+        input_modes=["application/json"],
+        output_modes=["application/json"],
+    )
+    # C1：翻译报告——演示 FilePart
+    skill_report = AgentSkill(
+        id="translate_report",
+        name="翻译报告",
+        description="返回含 source/target/元信息的文本报告文件（FilePart）。",
+        tags=["报告", "report", "FilePart"],
+        examples=["你好", "人工智能"],
+        input_modes=["text/plain"],
+        output_modes=["text/plain"],
     )
 
     # ========================================
@@ -115,7 +188,20 @@ def main():
                 url="http://127.0.0.1:9999",
             )
         ],
-        skills=[skill],
+        skills=[skill, skill_batch, skill_report],
+        # C2：声明 Bearer 鉴权方案（让客户端从 Agent Card 即可得知鉴权要求）
+        security_schemes={
+            "bearerAuth": SecurityScheme(
+                http_auth_security_scheme=HTTPAuthSecurityScheme(
+                    description="需要在 Authorization 头部携带 Bearer Token",
+                    scheme="bearer",
+                    bearer_format="demo-token",
+                )
+            )
+        },
+        security_requirements=[
+            SecurityRequirement(schemes={"bearerAuth": StringList(list=[])})
+        ],
     )
 
     # ========================================
@@ -140,10 +226,13 @@ def main():
     routes.extend(create_agent_card_routes(agent_card))
     routes.extend(create_jsonrpc_routes(request_handler, "/"))
 
-    # 将日志中间件加入 Starlette 应用
+    # 将日志 / 鉴权中间件加入 Starlette 应用（鉴权在日志后执行）
     app = Starlette(
         routes=routes,
-        middleware=[Middleware(RequestLoggingMiddleware)],
+        middleware=[
+            Middleware(RequestLoggingMiddleware),
+            Middleware(BearerAuthMiddleware),
+        ],
     )
 
     # ========================================
@@ -162,7 +251,8 @@ def main():
     print("=" * 60)
     print(f"  Agent 名称:  {agent_card.name}")
     print(f"  Agent 版本:  {agent_card.version}")
-    print(f"  技能:        {skill.name}")
+    print(f"  技能:        {skill.name} / {skill_batch.name} / {skill_report.name}")
+    print(f"  鉴权:        Bearer token（有效 token：{sorted(VALID_BEARER_TOKENS)}）")
     print(f"  服务地址:    http://127.0.0.1:9999")
     print(f"  Agent Card:  http://127.0.0.1:9999/.well-known/agent-card.json")
     print(f"  日志级别:    INFO（含底层请求/响应详情）")
