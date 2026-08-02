@@ -4,43 +4,54 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-A2A (Agent2Agent) protocol tutorial demo built with `a2a-sdk`. It demonstrates a closed-loop interaction between three roles: User, Client Agent, and Remote Agent (A2A Server). The Remote Agent is a mock Chinese-to-English translator using a preset dictionary — no LLM integration.
+A2A (Agent2Agent) protocol tutorial demo built on `a2a-sdk`. It demonstrates a closed loop between three roles: User, Client Agent, and Remote Agent (A2A Server). The Remote Agent is a mock Chinese→English translator backed by a preset dictionary — no LLM. Code comments, logs, and README are in Chinese; the demo is teaching material, so verbose logging and step-by-step comments are intentional.
 
 ## Commands
 
+`python` is not on PATH — the venv must be activated (or use `.venv/bin/python` directly).
+
 ```bash
-# Install dependencies
+source .venv/bin/activate
 pip install -r requirements.txt
 
-# Start the A2A server (Remote Agent) on port 9999
+# Terminal 1 — start the Remote Agent on 127.0.0.1:9999
 python -m server
 
-# Run the client demo (requires server to be running first, in a separate terminal)
+# Terminal 2 — run the 9-stage client demo
 python main.py
 ```
 
+There is no test suite, linter, or build step. Verification is running the demo end to end and checking stage output (README has an expected-output table per stage).
+
+**Running a single stage:** each stage is an independent `async def stage_xxx(client_agent)` in `main.py`. Comment out unwanted `await stage_xxx(...)` calls in `main()`. `stage_discovery` is a prerequisite for everything else — it populates `agent_card`, which is needed to resolve the RPC URL.
+
+Port 9999 left occupied by a stale server: `lsof -ti :9999 | xargs kill -9`.
+
 ## Architecture
 
-**Server side** (`server/`):
-- `__main__.py` — Entry point. Defines `AgentSkill`, `AgentCard`, wires `DefaultRequestHandler` with `InMemoryTaskStore`, registers Starlette routes (agent card + JSON-RPC), starts Uvicorn on `127.0.0.1:9999`. Includes `RequestLoggingMiddleware` for verbose HTTP logging.
-- `agent.py` — `TranslatorAgent`: pure business logic. Uses a hardcoded dictionary (`MOCK_TRANSLATIONS`) with simulated async delay. Has both `invoke()` (full result) and `stream()` (word-by-word generator) methods.
-- `agent_executor.py` — `TranslatorAgentExecutor` implements the SDK's `AgentExecutor` interface. Bridges the A2A protocol layer and `TranslatorAgent`. Manages full Task lifecycle: create task → WORKING → extract user text → call agent → emit Artifact → COMPLETED (or FAILED on error).
+**Server** (`server/`):
+- `__main__.py` — Builds 3 `AgentSkill`s + the `AgentCard` (including `security_schemes`), wires `DefaultRequestHandler` with `InMemoryTaskStore`, registers agent-card + JSON-RPC routes, mounts two Starlette middlewares (`RequestLoggingMiddleware` then `BearerAuthMiddleware`), runs Uvicorn.
+- `agent.py` — `TranslatorAgent`, pure business logic, no protocol types. `MOCK_TRANSLATIONS` dict plus `classify_input()` (drives input-required/reject), `invoke()`, `stream()`, `translate_batch()`, `build_translation_report()`, `slow_translate()` (segmented output with a `cancel_event` probe).
+- `agent_executor.py` — `TranslatorAgentExecutor` implements the SDK `AgentExecutor`. Routes by `skill_id`, then by `mode`, and emits every lifecycle event through `TaskUpdater`.
 
-**Client side** (`client/`):
-- `client_agent.py` — `TranslatorClientAgent` wraps `A2ACardResolver` (discovery) and `create_client` (communication). Supports both streaming and non-streaming modes via `ClientConfig(streaming=...)`. Parses `StreamResponse` oneof payloads (task, message, status_update, artifact_update).
+**Client** (`client/client_agent.py`) — `TranslatorClientAgent` wraps `A2ACardResolver` (discovery) and `create_client`. Each public method builds its own client via `_make_client(streaming=...)` and closes it in a `finally`, so streaming and non-streaming calls never share state. Non-streaming results are folded into a `TranslateResult` dataclass by `_absorb_chunk_into_result` / `_absorb_part`.
 
-**User entry** (`main.py`):
-- Runs a 3-phase demo: Agent Discovery → Non-streaming translate → Streaming translate. Prints formatted output showing the role-based message flow.
+**Entry** (`main.py`) — 9 sequential stages: discovery → non-streaming → streaming → input-required follow-up → cancel → reject → task query → DataPart/FilePart → Bearer auth.
 
-## Key A2A Concepts Used
+## Conventions and Gotchas
 
-- **Agent Card** (`/.well-known/agent-card.json`) — Agent metadata including skills, capabilities, and interface URLs
-- **AgentSkill** — Declares what the agent can do (id, name, description, tags, examples)
-- **Task lifecycle** — SUBMITTED → WORKING → Artifact produced → COMPLETED (or FAILED)
-- **AgentExecutor** — SDK interface connecting protocol layer to business logic via `execute()` / `cancel()`
-- **EventQueue** — Used in executor to emit `TaskStatusUpdateEvent` and `TaskArtifactUpdateEvent`
-- **StreamResponse** — Oneof payload: `task`, `message`, `status_update`, `artifact_update`
+**Types are protobuf, not Pydantic.** Messages come from `a2a.types.a2a_pb2`. `Part` is a flat oneof (`text` / `data` / `raw`), so always probe with `part.HasField("text")`, never truthiness. `Message.metadata` is a `google.protobuf.Struct`, read as `msg.metadata.fields["key"].string_value`.
 
-## Tech Stack
+**`Message.message_id` is required.** `new_text_message()` fills it in; hand-built messages (e.g. empty text carrying only a DataPart) must set `message_id=str(uuid.uuid4())` or the request fails with `InvalidParamsError: Validation failed`.
 
-Python 3.12, `a2a-sdk[http-server]`, Starlette, Uvicorn, httpx, Pydantic, protobuf, sse-starlette
+**Use `TaskUpdater`, never hand-written `TaskStatusUpdateEvent` / `TaskArtifactUpdateEvent`.** It fills task/context ids and timestamps and enforces a terminal-state lock. Methods map to states: `start_work` → WORKING, `requires_input` → INPUT_REQUIRED, `complete` / `cancel` / `reject` / `failed` → terminal, `add_artifact` → artifact event.
+
+**Do not re-enqueue the Task on a follow-up turn.** `new_task_from_user_message()` already produces a SUBMITTED task, so the first turn only needs `event_queue.enqueue_event(task)`. On a follow-up (`context.current_task` is non-empty) the SDK has already restored the task from `TaskStore`; enqueuing again pushes the stale INPUT_REQUIRED snapshot into the result aggregator and the client never sees the new WORKING → COMPLETED flow. Guarded by `if not is_followup:` in `agent_executor.py`.
+
+**Cancel is split across two coroutines.** `DefaultRequestHandler` calls `cancel()` and then cancels the `execute()` coroutine. `cancel()` must itself emit the CANCELED terminal state (the aggregator errors out otherwise) and set the `asyncio.Event` in `self._cancel_events[task_id]` so the slow loop exits. `execute()` deliberately swallows nothing on `CancelledError` — it re-raises without writing a terminal state.
+
+**Skill routing goes through message metadata, not the protocol.** The client puts `skill_id` (and `mode`) into `Message.metadata`; the executor reads it and branches. Skills: `translate_zh_to_en` (default text), `translate_batch_zh_to_en` (DataPart in/out), `translate_report` (FilePart out). Batch and report paths skip the Chinese-character validation.
+
+**DataPart construction:** `dict` → `google.protobuf.struct_pb2.Value` via `ParseDict`, then `Part(data=value, media_type="application/json")`; decode with `MessageToDict(part.data)`. **FilePart:** `Part(raw=bytes, filename=..., media_type=...)`.
+
+**Bearer auth.** `VALID_BEARER_TOKENS` in `server/__main__.py` must stay in sync with `DEFAULT_AUTH_TOKEN` in `main.py` (`demo-secret-token`), otherwise everything after discovery fails with `A2AClientError: HTTP Error 401`. `/.well-known/` is whitelisted in `PUBLIC_PATH_PREFIXES` and must stay public — discovery happens before the client has any token.
